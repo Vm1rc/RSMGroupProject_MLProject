@@ -1,0 +1,229 @@
+---
+title: "Lasso regression"
+author: "Group 11"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+    toc_float: no
+editor_options:
+  chunk_output_type: inline
+---
+
+## Environment setup
+```{r}
+# Clean environment
+remove(list=ls())
+```
+
+## Packages
+
+Let's start by loading the packages we will need.
+```{r}
+library("tidymodels")
+library("glmnet")
+library("kernlab")
+library("skimr")
+library("kknn")
+library("themis")
+```
+
+## Loading the data
+```{r}
+load(file = file.path("~/dataFirstIteration.RData"))
+```
+
+The data has already been cleaned and prepared. During the data cleaning process, the data is already been split into a training and test sets.
+Thereby, the folds for performing cross-validation have also been set up during the data cleaning. We can now explore the data to get a quick look at all the features used in the data.
+
+## Explore the data
+```{r}
+dfTrain %>% skim()
+```
+
+Because we already have the cleaned data, we can have a look at the balance between the default and paid loans
+to check if this is the same as in the original data set.
+
+## Final check
+```{r}
+dfTrain %>% count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+dfTest %>% count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+```
+
+## Initial model
+First we create the model to compare with the other models. After the first round of modelling, the best two models will be further optimized.
+
+# Modelling
+
+We will now setup a workflow for the lasso logistic regression model. When this is done, we tune it. We use the CV folds we created earlier for tuning, and test it on the test set once tuning is done to get the final results.
+
+## Setting up workflows
+
+Not all the features are already numeric as they have to be for logistic regression. We therefor use step_dummy() to transform factor variables into numeric variables. The features that are already numeric, we normalize them since for regularization the features should be on the same scales. 
+
+We set up the recipe:
+```{r}
+glmnet_recipe <-   recipe(loan_status ~ int_rate + loan_amnt + home_ownership + annual_inc + emp_length + verification_status + open_acc + fico_range_low  + purpose + delinq_2yrs + pub_rec + Division + earliest_cr_line_year + installment, 
+         data = dfTrain) %>% 
+  step_downsample(loan_status, seed = 23257) %>%
+  step_dummy(home_ownership, emp_length, verification_status, purpose, Division) %>% 
+  step_normalize(int_rate, loan_amnt, annual_inc, open_acc, fico_range_low, delinq_2yrs, pub_rec, earliest_cr_line_year, installment)
+```
+
+We then set up the model using the following:
+```{r}
+lasso <- logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet")
+```
+
+To facilitate tuning, we now set up a workflow:
+```{r}
+lasso_wf <- workflow() %>% 
+  add_recipe(glmnet_recipe) %>% 
+  add_model(lasso)
+```
+
+## Tuning the models
+
+For tuning the model, we need to decide on what metrics we are interested in. In this case we are interested in accuracy, COhen's Kappa, sensitivity, specificity and AUC (roc_auc()).
+```{r}
+class_metrics <- metric_set(accuracy, kap, sensitivity, specificity, roc_auc)
+```
+
+Now we are ready to tune the models. For that, we need to specify a tuning grid.
+We set up a grid for $\lambda$.
+```{r}
+grid_lasso <- tibble(penalty = 10^(seq(from = -4.5, to = -1, length.out = 100)))
+```
+
+Now that we have the tuning grid, we can use `tune_grid()` for 10-fold cross validation:
+```{r}
+lasso_tune <- lasso_wf %>% 
+  tune_grid(resamples = cv_folds, 
+            grid = grid_lasso,
+            metrics = class_metrics)
+```
+
+## Visualising the results
+We can now collect the metrics and create some plots of the metrics used for the lasso model:
+```{r}
+lasso_tune_metrics <- lasso_tune %>% 
+  collect_metrics()
+lasso_tune_metrics
+```
+
+Here we see plots for all the five metrics used:
+```{r}
+lasso_tune_metrics %>% 
+  ggplot(aes(x = penalty, y = mean)) + 
+  geom_point() + geom_line() + 
+  facet_wrap(~ .metric, scales = "free_y")
+```
+
+```{r}
+autoplot(lasso_tune)
+```
+
+Here we create a plot of the accuracy:
+```{r}
+lasso_tune_metrics %>% filter(.metric == "accuracy") %>% 
+  ggplot(aes(x = penalty, y = mean, 
+             ymin = mean - std_err, ymax = mean + std_err)) + 
+  geom_errorbar(alpha = 0.5) + 
+  geom_point() + 
+  scale_x_log10() + 
+  labs(y = "Accuracy", x = expression(lambda))
+```
+
+Here we create a plot of the Cohen's Kappa:
+```{r}
+lasso_tune_metrics %>% filter(.metric == "kap") %>% 
+  ggplot(aes(x = penalty, y = mean, 
+             ymin = mean - std_err, ymax = mean + std_err)) + 
+  geom_errorbar(alpha = 0.5) + 
+  geom_point() + 
+  scale_x_log10() + 
+  labs(y = "Kappa", x = expression(lambda))
+```
+
+Here we create a plot of the sensitivity:
+```{r}
+lasso_tune_metrics %>% filter(.metric == "sensitivity") %>% 
+  ggplot(aes(x = penalty, y = mean, 
+             ymin = mean - std_err, ymax = mean + std_err)) + 
+  geom_errorbar(alpha = 0.5) + 
+  geom_point() + 
+  scale_x_log10() + 
+  labs(y = "sensitivity", x = expression(lambda))
+```
+
+Here we create a plot of the specificity:
+```{r}
+lasso_tune_metrics %>% filter(.metric == "specificity") %>% 
+  ggplot(aes(x = penalty, y = mean, 
+             ymin = mean - std_err, ymax = mean + std_err)) + 
+  geom_errorbar(alpha = 0.5) + 
+  geom_point() + 
+  scale_x_log10() + 
+  labs(y = "specificity", x = expression(lambda))
+```
+
+Here we create a plot of the roc_auc:
+```{r}
+lasso_tune_metrics %>% filter(.metric == "roc_auc") %>% 
+  ggplot(aes(x = penalty, y = mean, 
+             ymin = mean - std_err, ymax = mean + std_err)) + 
+  geom_errorbar(alpha = 0.5) + 
+  geom_point() + 
+  scale_x_log10() + 
+  labs(y = "Roc Cruve", x = expression(lambda))
+```
+
+In this case, with the certain goal we have, sensitivity is the metric where we are most interested in. Thus, we want to know what the best 5 possibles models are based on sensitivity.
+```{r}
+lasso_best_sens <- show_best(lasso_tune, metric= "sensitivity", n = 5)
+lasso_best_sens
+```
+
+We now select the best model based on sensitivity.
+```{r}
+lasso_best_sens <- select_best(lasso_tune, metric= "sensitivity")
+lasso_best_sens
+```
+
+We can now finalize the workflow for the lasso model:
+```{r}
+lasso_wf_tuned <- 
+  lasso_wf %>% 
+  finalize_workflow(lasso_best_sens)
+lasso_wf_tuned
+```
+
+# Test set performance
+We are now ready to train the model on the entire training data set, to evaluate it on the test set.
+```{r}
+lasso_last_fit <- lasso_wf_tuned %>% 
+  last_fit(dfTrain_split, metrics = class_metrics)
+```
+
+The performance on the test set for this model is:
+```{r}
+lasso_test_metrics <- lasso_last_fit %>% collect_metrics()
+lasso_test_metrics
+```
+
+These are the initial results that will be used to compare with the other models. The 2 best performing models will then be further optimized. We do see that Lasso Logistic Regression provides a sensitivity of 0.6400, which is not quite close to our goal of 70%.
+
+We can arrange the estimated coefficients for the lasso model in decreasing absolute value:
+```{r}
+lasso_last_fit %>% extract_fit_parsnip() %>% 
+  tidy() %>% arrange(desc(abs(estimate)))
+```
+# Save all the outputs
+```{r}
+save(lasso_best_sens, lasso_last_fit, lasso_test_metrics, glmnet_recipe, grid_lasso, lasso_tune_metrics, lasso_tune, lasso_wf, lasso_wf_tuned, lasso, class_metrics, file = "outputLasso.RData")
+```

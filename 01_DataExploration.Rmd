@@ -1,0 +1,504 @@
+---
+title: "Data Exploration and Cleaning"
+author: "Group 11"
+output: 
+  html_notebook:
+    toc: true
+    toc_float: false
+editor_options: 
+  chunk_output_type: inline
+---
+## Setting the goal
+
+The goal of this assignment is to predict loan default before a loan is issued. Therefore, in essence, we need to find the best possible model for predicting loan default. 
+
+The following assumptions are made:
+
+As the data we use is imbalanced (only 14.46% has the status defaulted and the rest was payed back fully), it does not make sense to use the metric accuracy. Accuracy is no longer a proper measure, since it does not distinguish between the numbers of correctly classified examples of different classes. Hence, it may lead to erroneous conclusions. We therefore choose to use specificity and sensitivity as metrics. We also choose to use the ROC-curve to described the models capability to distinguishing between classes
+
+In this case we aim to achieve a high level of sensitivity (goal is set to 70% or higher) because we want to uncover most loans that will default. We also want to make sure we avoid false negatives. In this case this would mean we predict a loan is going to be fully paid but eventually it ends up defaulting. False negatives are damaging in this case because it can result in a negative return. Summarized, our priority is to identify defaulting loans and accept that we might flag some loans as default too much.
+
+We also want to have a relatively high specificity (goals is set to 60% or higher) as we want our model to identify loans that are fully repaid as well. However, we prefer a high level of sensitivity over a high level of specificity, as described above. 
+
+For our first iterations of our chosen models, we compare by looking solely at the sensitivity. Thereafter, with the second iteration, sensitivity, specificity and roc_auc are taken into account. 
+
+This whole process will eventually leave us with one final model that is our recommendation of best model to use for a problem like this one.
+
+## Paths & Environment setup
+.Rmd files will use the folder they are located in as their default working directory. Because we use a shared OneDrive folder, this makes it easy to cooperate as no individual working directories have to be set up for each group member. We add an output folder for saving plots, graphs, tables, etc.
+```{r}
+# Clean environment
+remove(list=ls())
+
+# dirOutput contains the path to the output folder on OneDrive
+dir <- getwd()
+dirOutput <- paste0(dir,"/01_Output/")
+dirOutput
+```
+
+## Packages
+
+Several package are loaded needed for data cleaning and exploration. 
+
+```{r}
+# Random forest tutorial
+library("tidyverse")
+library("tidymodels")
+library("doParallel")
+library("themis")
+library("xgboost")
+library("skimr")
+library("corrplot")
+library("stargazer")
+library("ggridges")
+library("treemapify")
+library("knitr")
+```
+
+
+## Loading  the data
+
+The original provided data is loaded 'csv_train'.
+
+```{r}
+dfTrainFull <- read.csv("loans_train.csv", header = TRUE)
+```
+
+
+
+## Summary of all implications from data cleaning
+
+This section contains a summary of all findings of the data exploration.  
+
+General comments: 
+- for NA we can also use step_impute_XY() in the recipe or during data cleaning (https://statisticsglobe.com/mode-imputation/). In our case we deleted observations with NAs, because it was only a small number (details below)
+
+Summary of the findings:
+There are three categories of insights with regard to the variables available:
+i) Metadata: 
+  - id 
+  - title: same as information as purpose => delete
+  
+ii) Leaking: 
+  - recoveries: => delete 
+  - total_paymnt: => delete
+  - dti: Is deemed to be leaking, however it is not 100% certain => delete
+  - funded_amnt_inv: => delete
+  - installment: Unclear if leaking => leave in, but might exclude during modeling
+
+iii) Correlated: 
+  - funded_amnt: Correlated with loan_amnt + maybe leaking => delete
+  - fico_range_high: Correlated with fico_range_high + also many outliers, but for default and non-default (high scores) => delete 
+  - sub_grade: highly correlated with grade (just more granular) => delete
+  - grade: Highly correlated with `interest_rate` => delete
+  
+iv) Otherwise problematic:
+  - dti: outliers are for fully paid loans and is deemed to be leaking + NAs => delete
+  - emp_title: to many levels and NAs => delete
+  - addr_state: many categories, but states show highly different default-rates => added mapping of region and Division according to US Census classification => use Division
+  - zip_code: too many categories => delete
+  - earliest_cr_line_month: too granular, not useful => delete
+  - earliest_cr_line_year: numeric value for year => transform into number of years 
+  - annual_inc: extreme outliers, spread, and skewed => log-transformation
+  - emp_length: Many NAs for 0 values and factor => change NA to "not given" (factor) => leave but experiment in modeling
+  - purpose: => grouping needed
+  - home_ownership => remove observations with ANY, NONE
+
+## Cleaning the data
+
+### First look at the data
+
+Different methods for exploring the data are used. This allows checking for variables with NAs and wrong data types.
+```{r}
+stargazer(dfTrainFull, type ="text")
+
+skim(dfTrainFull) %>% knit_print() 
+
+str(dfTrainFull)
+```
+
+###Checking for correlation between variables
+
+This plot allows to check for correlation between numeric variables. Please note that no correlation between numerical and categorical variables can be detected this way (e.g. grade and int_rate which can be seen later on)
+```{r}
+dfTrainFull %>% select_if(is.numeric) %>% 
+  cor() %>% corrplot()
+```
+
+###Mutate some variables in the dataset
+Based on this first exploration several adjustments are made to the original dataset. For details see code:
+```{r}
+# replacing na values with "not given"
+dfTrainFull$emp_length[is.na(dfTrainFull$emp_length)] <- "Not given"
+
+#Changing values for variable loan status to "default" and "paid"
+dfTrainFull$loan_status[dfTrainFull$loan_status == "Charged Off"] <- "default"
+dfTrainFull$loan_status[dfTrainFull$loan_status == "Fully Paid"] <- "paid"
+
+# mutate all character columns to factor
+dfTrainFull[sapply(dfTrainFull, is.character)] <- lapply(dfTrainFull[sapply(dfTrainFull, is.character)], as.factor)
+
+#output all levels of the dataset for checking
+levels(dfTrainFull$loan_status)
+str(dfTrainFull)
+```
+
+## More detailed data exploration
+For a more detailed exploration of the data several plots and visualizations are performed.
+### Plotting distributions of numeric variables grouped by loan_status
+The most promising features for performing classification are those for which the conditional distributions (with respect to `loan_status`) differ most. On a first inspection int_rate and fico_range_low seems promising.
+```{r}
+dfTrainFull %>% group_by(loan_status) %>%
+  skim(-loan_amnt, -funded_amnt, -int_rate, -annual_inc, -dti, -fico_range_high)%>% 
+  yank("numeric") %>%
+  knit_print() 
+```
+
+### Plotting a selection of relevant variables with regard to loan_status
+Plotting annual_inc shows a strongly skewed distributions with outliers on the top side. These outliers are all in the category 'paid', implicating that people with extreme high incomes pay their loans back.
+```{r}
+#Distribution and Bioxplot for 'annual_inc'
+# Shows outliers and skeweness
+ggplot(dfTrainFull, aes(x=annual_inc)) + geom_density()
+
+ggplot(dfTrainFull, aes(x = loan_status, y = annual_inc, fill = loan_status)) + 
+  geom_boxplot(alpha = 0.5)
+```
+The follwoing plots shows loans_status with regard of the grade of the loan. The lower the grade the higher the ratio of default/non-default.
+```{r}
+# Density plot for "grade": 
+
+ggplot(dfTrainFull, aes(x = grade, fill = loan_status)) + 
+  geom_density(alpha = 0.5)
+```
+
+The distribution of fico_range_low and fico_range_high look similar, to some degree useful to separate defaults. However, these two variables are highly correlated and therefore only fico_range_low will be included.
+```{r}
+ggplot(dfTrainFull, aes(x = loan_status, y = fico_range_low, fill = loan_status)) + 
+  geom_boxplot(alpha = 0.5)
+ggplot(dfTrainFull, aes(x = loan_status, y = fico_range_high, fill = loan_status)) + 
+  geom_boxplot(alpha = 0.5)
+```
+
+### Conditional distribution of `loan_status` given `grade`
+Analyzing `grade` and `sub_grade`. Increasing proportion of default with lower grades. Relationship seems linear and constant except the lowest grade. sub_grade is strongly correlated with grade, because it is an hierarchical layer. Therefore only of them should be used. We choose grade because it is less granular (not too many levels for a factor).
+```{r}
+dfTrainFull %>% 
+  ggplot(aes(x = grade, fill = loan_status)) +
+  geom_bar(position = "fill")
+
+dfTrainFull %>% 
+  ggplot(aes(x = sub_grade, fill = loan_status)) +
+  geom_bar(position = "fill") + theme(axis.text.x=element_text(angle=90,margin = margin(0.1, unit = "cm"),vjust =0.5))
+```
+Analyzing `verification_status` as table and plot. Some small differences observable. It can be observed that verified debtors have a higher default-ratio. This is interesting because the intuition would be that verified debtors shows more commitment.
+
+```{r}
+# more defaults for verified borrower - can this be explained?
+dfTrainFull %>% 
+  count(loan_status, verification_status) %>% 
+  group_by(loan_status) %>% 
+  mutate(prop = n / sum(n))
+
+# creating a new variable verification_any => migth be deleted later
+dfTrainFull %>% 
+   mutate(verification_any = if_else(verification_status == "Source Verified" | verification_status == "Verified", "Verified","Not Verified")) %>%
+   ggplot(aes(x = verification_any, fill = loan_status)) +
+   geom_bar(position = "fill")
+
+```
+
+By plotting purpose we can identify varying default rates among the subgroups. This indicates that this variable is a good predictor. 
+```{r}
+# outputs table of proportion and count of default per purpose-value
+dfTrainFull %>% 
+  count(loan_status, purpose) %>% 
+  group_by(loan_status) %>% 
+  mutate(prop = n / sum(n))
+#plots stacked bar per purpose-value
+ggplot(dfTrainFull, aes(x = purpose, fill = loan_status)) + 
+  geom_bar(alpha = 0.5) + theme(axis.text.x=element_text(angle=90,margin = margin(1, unit = "cm"),vjust =1))
+
+# created grouped dataframe
+dfTrainFullGrouped <- dfTrainFull %>% 
+  group_by(dfTrainFull$purpose) %>%
+  count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+#renaming column in new df
+names(dfTrainFullGrouped)[1] <- "purposeGrouped" #renaming column
+dfTrainFullGrouped$uniqueName <- paste(dfTrainFullGrouped$purposeGrouped, dfTrainFullGrouped$loan_status)
+# plot grouped purpose-values withr regard to default proportion
+ggplot(dfTrainFullGrouped, aes(x = purposeGrouped, y = prop, fill = loan_status)) + 
+  geom_bar(alpha = 0.5, stat="identity") + theme(axis.text.x=element_text(angle=90,margin = margin(1, unit = "cm"),vjust =1))
+
+
+```
+
+By plotting  interest_rate with regard to grade we can see that these two variables are strongly correlated. Interest rate is clearly connected with the grade of the loan, might correlated too much. We decide to exclude grade. 
+```{r}
+dfTrainFull %>% 
+  ggplot(aes(x = int_rate, y = grade)) + 
+  geom_density_ridges(bandwidth = 0.2)
+```
+
+Analyzing default-rate per state as treemap: significant differences in default-ratio per state
+```{r}
+# Documentation for treeplot: https://rpubs.com/techanswers88/treemap_ggplot
+dfTrainFullTreemap <- dfTrainFull %>%
+  group_by(dfTrainFull$addr_state) %>%
+  count(dfTrainFull$loan_status == "default")%>%
+  rename(defaultStatus = "dfTrainFull$loan_status == \"default\"") %>%
+  rename(addr_state = "dfTrainFull$addr_state") %>%
+  mutate(propDefault = n / sum(n)) %>%
+  filter(defaultStatus == TRUE) %>%
+  mutate(propDefault= round(propDefault, 3))
+
+pTreemap <- ggplot(data = dfTrainFullTreemap,aes(fill=addr_state, area=propDefault, 
+                                             label = propDefault))
+pTreemap <- pTreemap + geom_treemap()
+pTreemap <- pTreemap + geom_treemap_text(colour ="white", place = "centre") 
+#pTreemap <- pTreemap + theme(legend.position = "none")
+pTreemap
+
+# Alternatively we can display the default-rate as a label and the state as legend
+
+```
+
+### Removing and engineering variables
+Based on the insights gained so far we adjust the data set by applying 3 main changes:
+i) Excluding variables
+ii) Transform variables, e.g. annual_inc or emp_length
+iii) Remap categorical variables into less levels, e.g. purpose, addr_state
+
+```{r}
+# Removing leaking variables from the dataset completely
+dfTrainFull$recoveries <- NULL
+dfTrainFull$total_pymnt <- NULL
+dfTrainFull$dti <- NULL
+dfTrainFull$funded_amnt_inv <- NULL
+dfTrainFull$fico_range_high <- NULL
+dfTrainFull$sub_grade <- NULL
+dfTrainFull$grade <- NULL
+dfTrainFull$emp_title <- NULL
+dfTrainFull$zip_code <- NULL
+dfTrainFull$earliest_cr_line_month <- NULL
+dfTrainFull$title <- NULL
+dfTrainFull$funded_amnt <- NULL
+
+# Transforming into Number of years instead of YYYY
+dfTrainFull$earliest_cr_line_year <- max(dfTrainFull$earliest_cr_line_year) - dfTrainFull$earliest_cr_line_year
+
+# Log-Transform 'annual_inc'
+# Change 0 values to 1 before log-transforming
+dfTrainFull$annual_inc[dfTrainFull$annual_inc == 0] <- 1
+dfTrainFull$annual_inc <- log(dfTrainFull$annual_inc)
+
+# Aggregate 'addr_state' into larger regions for valid k-fold split
+dfStateMapping <- read.csv("StateMapping.csv", header = TRUE)
+
+dfTrainFull <- merge(x=dfTrainFull, y=dfStateMapping, by.x = "addr_state", by.y = "State.Code")
+
+# Aggregate 'purpose' into larger groups
+dfTrainFull$purpose <- as.character(dfTrainFull$purpose) # converting to character for replacement needed
+
+dfTrainFull$purpose[dfTrainFull$purpose == "car"] <- "ConsumerCredit"
+dfTrainFull$purpose[dfTrainFull$purpose == "major_purchase"] <- "ConsumerCredit"
+dfTrainFull$purpose[dfTrainFull$purpose == "vacation"] <- "ConsumerCredit"
+
+dfTrainFull$purpose[dfTrainFull$purpose == "home_improvement"] <- "Housing"
+dfTrainFull$purpose[dfTrainFull$purpose == "house"] <- "Housing"
+dfTrainFull$purpose[dfTrainFull$purpose == "moving"] <- "Housing"
+
+dfTrainFull$purpose[dfTrainFull$purpose == "other"] <- "other"
+dfTrainFull$purpose[dfTrainFull$purpose == "renewable_energy"] <- "other"
+
+dfTrainFull$purpose <- as.factor(dfTrainFull$purpose)
+
+# Drop obersvations with values "any" or "None" from variable "home_ownership"
+dfTrainFull <- dfTrainFull[!(dfTrainFull$home_ownership == "ANY" | dfTrainFull$home_ownership == "NONE" ),]
+
+# mutate all character columns to factor
+dfTrainFull[sapply(dfTrainFull, is.character)] <- lapply(dfTrainFull[sapply(dfTrainFull, is.character)], as.factor)
+
+skim(dfTrainFull) %>% knit_print() 
+
+```
+
+## Model assessment setup 
+### Splitting data sets 
+Type of sets:
+i) `loans_test.csv` = (dfTestFull)
+  viii) dfTrainFull
+ii) `loans_train.csv`= (dfTrainFull) 
+  iii) dfTrain iv) dfTest
+    v) cv_folds (10- and 5-fold)
+    For ensembles: Recipes withh different downsampling ratios are created:
+      vi) recipe_downsample_1_1 vii) recipe_downsample_1_2
+    
+Creating initial split in dfTrainFull:
+```{r}
+set.seed(34728)
+dfTrain_split <- initial_split(data = dfTrainFull, prop = 0.75, 
+                          strata = loan_status)
+
+```
+
+The separate sets are then obtained by:
+
+```{r}
+dfTrain <- training(dfTrain_split)
+dfTest <- testing(dfTrain_split)
+```
+
+The default-ratio should be similar as in the original dfTrainFull.
+```{r}
+dfTrainFull %>% count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+dfTrain %>% count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+dfTest %>% count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+```
+
+### Creating 10-folds for Cross-validation
+Creating 10-fold stratified CV.
+```{r}
+# First iteration (based on dfTrain)
+set.seed(839574)
+cv_folds <- dfTrain %>% vfold_cv(v = 10, strata = loan_status)
+# Second iteration (based on dfTrainFull)
+set.seed(839574)
+cv_folds_Full <- dfTrainFull %>% vfold_cv(v = 10, strata = loan_status)
+```
+### Creating 5-folds for Cross-validation
+Creating 5-fold stratified CV.
+```{r}
+set.seed(839574)
+cv_folds5 <- dfTrain %>% vfold_cv(v = 5, strata = loan_status)
+```
+Once the model is tuned, we can test it once more on the test data. This will give an unbiased estimate of the generalization error.
+
+### Exporting datasets as RData-objects
+
+```{r}
+# First iteration
+save(dfTrain_split, dfTrainFull, dfTrain, dfTest, cv_folds, cv_folds5, file = file.path(dirOutput, "dataFirstIteration.RData"))
+
+# Second iteration (no split to create test set)
+save(dfTrainFull, cv_folds_Full, file = file.path(dirOutput, "dataSecondIteration.RData"))
+```
+
+
+# Adjusting data set 'csv_test' 
+The test data set 'csv_test' is prepared to match all adjustments conducted on the training data set 'csv_train'.
+
+```{r}
+# Loading test data and labels
+dfTestFull_labels <- read.csv("loans_test_labels.csv", header = TRUE)
+dfTestFull <- read.csv("loans_test.csv", header = TRUE)
+```
+
+```{r}
+# Merging lables with test data
+dfTestFull$loan_status <- dfTestFull_labels$loan_status
+head(dfTestFull)
+```
+```{r}
+# Removing unused column from label data set
+dfTestFull$total_pymnt <- NULL
+dfTestFull$recoveries <- NULL
+head(dfTestFull)
+```
+
+
+### Mutate some variables in the dataset
+```{r}
+
+# replacing na values with "not given"
+dfTestFull$emp_length[is.na(dfTestFull$emp_length)] <- "Not given"
+#Changing values for variable loan status to "default" and "paid"
+dfTestFull$loan_status[dfTestFull$loan_status == "Charged Off"] <- "default"
+dfTestFull$loan_status[dfTestFull$loan_status == "Fully Paid"] <- "paid"
+
+# mutate all character columns to factor
+dfTestFull[sapply(dfTestFull, is.character)] <- lapply(dfTestFull[sapply(dfTestFull, is.character)], as.factor)
+
+#output all levels of the dataset for checking
+levels(dfTestFull$loan_status)
+str(dfTestFull)
+```
+
+
+### Removing and engineering variables
+
+```{r}
+
+# Removing leaking variables from the dataset completely
+dfTestFull$recoveries <- NULL
+dfTestFull$total_pymnt <- NULL
+dfTestFull$dti <- NULL
+dfTestFull$funded_amnt_inv <- NULL
+dfTestFull$fico_range_high <- NULL
+dfTestFull$sub_grade <- NULL
+dfTestFull$grade <- NULL
+dfTestFull$emp_title <- NULL
+dfTestFull$zip_code <- NULL
+dfTestFull$earliest_cr_line_month <- NULL
+dfTestFull$title <- NULL
+dfTestFull$funded_amnt <- NULL
+
+# Transforming into Number of years instead of YYYY
+dfTestFull$earliest_cr_line_year <- max(dfTestFull$earliest_cr_line_year) - dfTestFull$earliest_cr_line_year
+
+
+# Log-Transform 'annual_inc'
+# Change 0 values to 1 before log-transforming
+dfTestFull$annual_inc[dfTestFull$annual_inc == 0] <- 1
+dfTestFull$annual_inc <- log(dfTestFull$annual_inc)
+
+# Aggregate 'addr_state' into larger regions for valid k-fold split
+dfStateMapping <- read.csv("StateMapping.csv", header = TRUE)
+
+dfTestFull <- merge(x=dfTestFull, y=dfStateMapping, by.x = "addr_state", by.y = "State.Code")
+
+# Aggregate 'purpose' into larger groups
+dfTestFull$purpose <- as.character(dfTestFull$purpose) # converting to character for replacement needed
+
+dfTestFull$purpose[dfTestFull$purpose == "car"] <- "ConsumerCredit"
+dfTestFull$purpose[dfTestFull$purpose == "major_purchase"] <- "ConsumerCredit"
+dfTestFull$purpose[dfTestFull$purpose == "vacation"] <- "ConsumerCredit"
+
+dfTestFull$purpose[dfTestFull$purpose == "home_improvement"] <- "Housing"
+dfTestFull$purpose[dfTestFull$purpose == "house"] <- "Housing"
+dfTestFull$purpose[dfTestFull$purpose == "moving"] <- "Housing"
+
+dfTestFull$purpose[dfTestFull$purpose == "other"] <- "other"
+dfTestFull$purpose[dfTestFull$purpose == "renewable_energy"] <- "other"
+
+# returning to factors
+dfTestFull$purpose <- as.factor(dfTestFull$purpose)
+
+
+# Drop observations with values "any" or "None" from variable "home_ownership"
+dfTestFull <- dfTestFull[!(dfTestFull$home_ownership == "ANY" | dfTestFull$home_ownership == "NONE" ),]
+
+# mutate all character columns to factor
+dfTestFull[sapply(dfTestFull, is.character)] <- lapply(dfTestFull[sapply(dfTestFull, is.character)], as.factor)
+
+```
+```{r}
+# Comparing both data sets from csv_train and csv_test for same structure
+skim(dfTestFull) %>% knit_print() 
+skim(dfTrainFull) %>% knit_print() 
+```
+
+
+### Save final test set as .RData
+```{r}
+save(dfTestFull, file = file.path(dirOutput, "FinalTest.RData"))
+```
+
+
+
+  
+  

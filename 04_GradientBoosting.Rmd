@@ -1,0 +1,835 @@
+---
+title: "Gradient Boosting"
+author: "Group 11"
+output: 
+  html_notebook:
+    toc: true
+    toc_float: false
+editor_options: 
+  chunk_output_type: inline
+---
+## Paths & Environment setup
+
+Rmd files will use the folder its in as the default working directory. We add an output folder for saving plots, graphs, tables, etc.
+```{r}
+# Clean environment
+remove(list=ls())
+
+# dirOutput contains the path to the output folder on OneDrive
+dir <- getwd()
+dirOutput <- paste0(dir,"/01_Output/")
+dirOutput
+```
+
+## Packages
+
+Let's start by loading the packages we will need. 
+```{r}
+# Random gradient boosting libraries
+library("tidyverse")
+library("dplyr")
+library("tidymodels")
+library("themis") 
+library("xgboost") # gradient boosting package
+library("skimr")
+library("ggridges")
+library("knitr")
+library("doParallel") # parallelize
+library("vip") # variable importance measures
+library("splitstackshape") # to create stratified sample
+```
+
+
+## Loading prepared data
+
+As the data was cleaned and formatted during data exploration and saved in an .RData file, this is the data we will load. It already has the dfTrain/dfTest split and the cv_folds that we will use for cross validation. After loading the data, we needed to check that all variables are in the right format. In the case of gradient boosting this means that all integer variables need to be changed to numeric.
+
+### Loading the data, examining it and converting the variables.
+```{r}
+load(file = file.path(dirOutput, "dataFirstIteration.RData"))
+skim(dfTrain) %>% knit_print()
+str(dfTrain)
+# convert variables from INT to NUM
+dfTrain <-dfTrain %>% 
+  mutate_at(vars(id, loan_amnt, delinq_2yrs, open_acc, pub_rec, fico_range_low, earliest_cr_line_year), as.numeric)
+```
+### Final checking to make sure imported data has the same ratio as complete data set.
+```{r}
+dfTrain %>% count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+dfTest %>% count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+# Both sets still show similar default-ratio
+```
+# Initial model
+First we create the model to compare with the others. After the first round of modeling, the best models will befurther optimized.
+
+## Recipe Setup
+Now we start by setting up a recipe. This process is very similar to the random forest recipe creation. We first start by getting the variable names an creating the model based on these names. Alternatively the function update_role works too, but because of the set up of the whole process this seemed easier for us.
+```{r}
+# Instead of including all variables by default, we only use selected (Alternative: update_role()). First we start by printing the names of the columns.
+cNames <- colnames(dfTrain)
+print(cNames)
+
+# Create the initial model that will be used. These are all the initial variables we deem important in predicting default.
+xgb_mdl1 <- loan_status ~ int_rate + annual_inc + delinq_2yrs + fico_range_low + earliest_cr_line_year + Division + home_ownership + verification_status + open_acc + loan_amnt + emp_length + pub_rec + purpose
+
+# Create the initial recipe that will be used to train. 
+xgb_recipe <- recipe(xgb_mdl1, data = dfTrain) %>% 
+  step_dummy(Division, home_ownership, verification_status, emp_length, purpose, one_hot = TRUE) %>%  # Only variables as factor, the rest are numeric
+  step_downsample(loan_status, seed = 23257) # We choose downsampling to decrease the computation time needed. The seed ensures that all models use the same downsampling, to ensure better comparison.
+xgb_recipe
+```
+
+## Tuning setup
+Set parameters for tuning, there are several parameters that we can choose for tuning. We will focus on ensemble size (number of trees), depth of each tree and the learning rate.
+```{r}
+xgb_model_tune <- 
+  boost_tree(trees = tune(), tree_depth = tune(), 
+             learn_rate = tune(), stop_iter = 500) %>% # Indicates that if the model does not improve after an additional 500 iterations, training will stop and the code will move on to the next combination of tuning parameters
+  set_mode("classification") %>%
+  set_engine("xgboost")
+```
+
+## Create workflow that can be tuned
+We now combine the recipe and model into a workflow that can be tuned.
+```{r}
+xgb_tune_wf <- workflow() %>%
+  add_recipe(xgb_recipe) %>%
+  add_model(xgb_model_tune)
+xgb_tune_wf
+```
+## Select metrics for perforance tuning
+We start by creating a metric set containing the metrics that we want to monitor. Here we will use accuracy, Cohen’s kappa, sensitivity, specificity and AUC (roc_auc())
+```{r}
+class_metrics <- metric_set(accuracy, kap, sensitivity, 
+                            specificity, roc_auc)
+```
+
+To speed up computation, we can do them in parallel using **doParallel**:
+```{r}
+registerDoParallel()
+```
+
+## Tuning grid
+Here we specify the tuning grid directly. We first try to make the grid as large as possible looking at the first 15.000 trees, 3 learning rates (0.1, 0.01 and 0.001) and tree depths 1-3. After the first iterations of models we will optimize this further. 
+```{r}
+xgb_grid <- expand.grid(trees = 500 * 1:30, # the number of trees
+                        learn_rate = c(0.1, 0.01, 0.001), # the learning rates
+                        tree_depth = 1:3) # the tree depths
+```
+
+## Run tuning
+We now perform a grid search based on 10-fold cross validation tuning.
+```{r}
+xgb_tune_res <- tune_grid(
+  xgb_tune_wf,
+  resamples = cv_folds,
+  grid = xgb_grid,
+  metrics = class_metrics)
+```
+
+## Selecting the tuning parameters' values
+We use the results of the calculation above to choose the best values for our tuning parameters. We can extract the metrics computed using our 10-fold CV as follows:
+
+```{r}
+xgb_tuning <- xgb_tune_res %>%
+  collect_metrics()
+xgb_tuning
+
+save(xgb_tuning, file = file.path(dirOutput, "xgb_tuning.Rdata")) # Save the results for ease of use
+
+# load with: xgb_tuning <- load(file = file.path(dirOutput, "xgb_tuning.Rdata"))
+```
+The results above are too many to visually inspect. Therefore we choose to visualize these in a few plots.
+
+### Visualising the results
+#### Misclassification rate:
+The Misclassification Rate is a performance metric that tells you the fraction of the predictions that were wrong, without distinguishing between positive and negative predictions.
+
+```{r}
+xgb_tuning %>% 
+  filter(.metric == "accuracy") %>% 
+  ggplot(aes(x = trees, y = 1 - mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "Misclassification rate") + 
+  facet_wrap(~ learn_rate)
+```
+The plots above show that a learning rate of 0.01 and tree depth of 2 will give us the lowest misclassification rate. However, because the data set is imbalanced accuracy is not a good measure for this problem and we need to look elsewhere.
+
+#### Sensitivity
+```{r}
+xgb_tuning %>% 
+  filter(.metric == "sensitivity") %>% 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "Sensitivity") + 
+  facet_wrap(~ learn_rate)
+```
+The sensitivity plot shows that a learning rate of 0.001 has an overall better performance with the higher amount of trees and a tree depth of 1 performing best. 
+
+#### Specificity
+```{r}
+xgb_tuning %>% 
+  filter(.metric == "specificity") %>% 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "Specificity") + 
+  facet_wrap(~ learn_rate)
+```
+The sensitivity plot shows that a learning rate of 0.01 has an overall better performance with the higher amount of trees and a tree depth of 2 or 3 performing best. However, as this is of secondary importance these results will not be leading.
+
+#### Accuracy, sensitivity, specificity and roc_auc together
+```{r}
+xgb_tuning %>%
+  filter(.metric %in% c("accuracy", "sensitivity", "specificity", "roc_auc")) %>%
+  ggplot(aes(x = trees, y = mean, colour = .metric)) +
+  geom_path() +
+  facet_wrap(learn_rate ~ tree_depth)
+```
+This overview shows the results of all of the parameters. As the sensitivity is best for tree depth of 1, learning rate of 0.001 and 10000-12500 trees, this will be our main point of focus.
+
+### Deciding on best parameters to use.
+Depending on which metric we want to focus we take a look at the results. In this instance sensitivity is chosen as primary concern, meaning top left graph will be leading. This gives us tree_depth = 1, learn_rate = 0.001 and somewhere between 10000 and 12500 trees. So lets take a look at these results. 
+
+```{r}
+xgb_tuning %>% 
+  filter(tree_depth == 1, learn_rate == 0.001, trees >= 10000 & trees <= 13000) %>% 
+  select(trees:learn_rate, .metric, mean) %>%
+    pivot_wider(trees:learn_rate,
+                names_from = .metric,
+                values_from = mean)
+```
+From these results can be concluded that at around 11500 trees would give the best all round results. There are only very slight differences between the metrics after this amount of trees.
+
+We now finalize our workflow using:
+
+```{r}
+xgb_best <- xgb_tuning %>% 
+  filter(.metric == "sensitivity", tree_depth == 1, learn_rate == 0.001, trees == 11500)
+xgb_final_wf <- finalize_workflow(xgb_tune_wf, xgb_best)
+xgb_final_wf
+```
+## Test set performance
+Now the model has been tuned, we can train the finalized workflow on the entire training set and predict the test set:
+```{r}
+xgb_final_fit <- xgb_final_wf %>%
+  last_fit(dfTrain_split, metrics = class_metrics)
+```
+
+The results on the test set for class predictions are:
+```{r}
+# results on the test set for class predictions
+xgb_test_results <- xgb_final_fit %>%
+  collect_metrics()
+xgb_test_results
+save(xgb_test_results, file = file.path(dirOutput, "xgb_test_results.Rdata"))
+# load with: xgb_tuning <- load(file = file.path(dirOutput, "xgb_test_results.Rdata"))
+```
+These are the initial results that will be used to compare with the other models. The 2 best performing models will then be further optimized. We do see that boosting provides a sensitivity of 0.6817, which is quite close to our goal of 70%.
+
+## Confusion matrix and visual assessments of performance
+We wrap up the initial modelling with some visual assessments of how the model has performed.
+
+### Confusion matrix
+A confusion matrix for the test set predictions are as follows:
+```{r}
+xgb_final_fit %>% collect_predictions() %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class) 
+```
+As one would expect, there are many more false positives than false negatives.
+
+### ROC curve
+```{r}
+xgb_final_fit %>% collect_predictions() %>% 
+  roc_curve(loan_status, .pred_default) %>% 
+  autoplot()
+```
+Although not bad, there is clearly room for improvement.
+
+### Lift curve
+```{r}
+xgb_final_fit %>% collect_predictions() %>% 
+  lift_curve(loan_status, .pred_default) %>% 
+  autoplot()
+```
+So when targeting the 25% of loans with the highest predicted probability of default, a bit less than twice as many loans that defaulted are identified compared to when targeting is done randomly.
+
+### Gain chart
+```{r}
+xgb_final_fit %>% collect_predictions() %>% 
+  gain_curve(loan_status, .pred_default) %>% 
+  autoplot()
+```
+When targeting the top 25% using this model, a little less than 50% of loans that will default would be uncovered.
+
+## Variable importance scores
+
+If we want variable importance measures, we need to do some extra work. We need to refit the model after specifying that we want variable importance to be computed as well.
+
+The most effort goes into setting up a workflow with a new model specification which explicitly requests permutation variable importance.
+
+```{r}
+# use best parameters from tuning
+xgb_model_tune_vi <- 
+  boost_tree(trees = 11500, tree_depth = 1, 
+             learn_rate = 0.001) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost", importance = "permutation")
+# Add model and recipe to create workflow
+xgb_vi_wf <- workflow() %>% 
+  add_model(xgb_model_tune_vi) %>% 
+  add_recipe(xgb_recipe)
+```
+
+Now we can fit the model again:
+
+```{r}
+# Run model on training data
+registerDoParallel()
+xgb_vi_fit <- xgb_vi_wf %>% fit(data = dfTrain) # manually fitting the workflow on the entire training data, can be used instead of last_fit
+```
+
+The **vip** package provides functions `vi()` for extracting the variable importance and `vip()` for plotting it:
+
+```{r}
+xgb_vi_fit_table <- xgb_vi_fit %>% extract_fit_parsnip() %>% vi() # retrieve fit-object and put into table
+xgb_vi_fit_table
+```
+```{r}
+# alternative with vip-package
+xgb_vi_fit %>% extract_fit_parsnip() %>% vip(geom = "point", num_features = 19)
+```
+
+The `int_rate` is by far the the most important feature, followed by fico_range_low and emp_length. We will use these results as the basis for optimization.
+
+# Optimizing the gradient boost machine
+As the results of the models were compared to each other, Random Forests and Gradient Boosting cam out on top. This means that we need to optimize the gradient boosting machine.
+
+Most of the processes for optimization are the same as earlier, so these will only lightly be explained. Most of the explanation goes into parameter tuning and variable selection for optimization.
+
+## Final checking imported data
+For the second iterations of modelling we created a new .RData file with all the necessary data we need. This includes the complete data set and cv_folds based on this data set.
+
+```{r}
+load(file = file.path(dirOutput, "dataSecondIteration.RData"))
+skim(dfTrainFull) %>% knit_print()
+str(dfTrainFull)
+# convert variables from INT to NUM
+dfTrainFull <-dfTrainFull %>% 
+  mutate_at(vars(id, loan_amnt, delinq_2yrs, open_acc, pub_rec, fico_range_low, earliest_cr_line_year), as.numeric)
+```
+
+Check whether the ratios are still the same.
+```{r}
+# Both sets still show similar default-ratio
+dfTrainFull %>% count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+```
+
+## Create a smaller data set for the optimization and tuning.
+For ease of use and less computation time, we make a smaller stratified sample of the complete data set. Here we have chosen to take a sample that consists of 20% of the complete set. We use the **splitstackshape** package for this.
+
+```{r}
+optSample <- stratified(dfTrainFull, "loan_status", 0.2)
+
+# Set still shows similar default ratio
+dfTrainFull %>% count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+optSample %>% count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+
+# Create the split
+set.seed(123)
+optSample_split <- initial_split(optSample, prop = 0.7, strata = loan_status)
+
+optTrain <- training(optSample_split)
+optTrain <- testing(optSample_split)
+```
+ 
+```{r}
+# Create 10 fold cv for optTrain
+set.seed(839574)
+cv_folds_opt <- optTrain %>% vfold_cv(v = 10, strata = loan_status)
+```
+
+## Tuning for optimization
+For optimization it is paramount that we find the best combination of parameters with variables. We chose to do the optimization first and solely based on the variables and their importance. After finding the best performing combination of variables we continue on to the parameter tuning.
+
+We chose to use 3 possible arguments for our variable selection based on the variable importance. These options are:
+1) Only variables that have an importance > 0.01. This left us with: int_rate + fico_range_low + home_ownership + loan_amnt + emp_length + verification_status
+
+2) Only variables with a positive importance, so only the variables showing up in the variable importance table. This left us with: int_rate + annual_inc + fico_range_low + earliest_cr_line_year + home_ownership + verification_status + open_acc + loan_amnt + emp_length + pub_rec
+
+3) Only the variables that surmount to the first 90% of variable importance. This left us with:  int_rate + fico_range_low + loan_amnt + emp_length
+
+Only the whole process for the best performing variable set is left in this notebook. We do however choose to present the results of the different options to show why we made the decision we made. We decided to compare two different sets of parameters per option. The test results are as follows:
+
+Option | Accuracy | Kappa | Sensitivity | Specificity | roc_auc
+-------|----------|-------|-------------|-------------|-----------
+1.1	   | 0.59	    | 0.127	| 0.662	      | 0.579	      | 0.67
+1.2	   | 0.578    |	0.142 |	0.730       |	0.552       |	0.699
+2.1	   | 0.647    |	0.133 |	0.555       |	0.663	      | 0.661
+2.2	   | 0.591    |	0.127 |	0.662       |	0.579       |	0.67
+3.1	   |0.605     |	0.133 |	0.647       |	0.598       |	0.67
+3.2	   |0.619     |	0.133 |	0.617       |	0.619       |	0.667
+
+Here we see that option 1.2 performs the best so that is a model with the variables, int_rate + fico_range_low + home_ownership + loan_amnt + emp_length + verification_status. Further parameter tuning also shows that 10500 trees, 0.001 learning rate and 1 tree depth are the best performing. This is not strange as it is quite similar to the first model.
+
+### Recipe Setup
+```{r}
+#Creating model variations
+xgb_mdlopt <- loan_status ~ int_rate + fico_range_low + home_ownership + loan_amnt + emp_length + verification_status
+
+#Creating recipe variations
+xgb_recipeopt <- recipe(xgb_mdlopt, data = optTrain) %>% 
+   step_dummy(home_ownership, verification_status, emp_length, one_hot = TRUE) %>%  # Only variables as factor, the rest are numeric
+  step_downsample(loan_status, seed = 23257)
+xgb_recipeopt
+```
+
+### Tuning setup
+#### Set parameters for tuning. Will focus on ensemble size, depth of each tree and the learning rate.
+```{r}
+xgb_model_tune_opt <- 
+  boost_tree(trees = tune(), tree_depth = tune(), 
+             learn_rate = tune(), stop_iter = 100) %>% # We choose for 100 iterations here to speed up the optimization process. This will be changed again later when we train and test the full model. 
+  set_mode("classification") %>%
+  set_engine("xgboost")
+```
+
+#### Create workflow that can be tuned:
+```{r}
+xgb_tune_wf_opt <- workflow() %>%
+  add_recipe(xgb_recipeopt) %>%
+  add_model(xgb_model_tune_opt)
+xgb_tune_wf_opt
+```
+
+#### Select metrics
+```{r}
+class_metrics <- metric_set(accuracy, kap, sensitivity, 
+                            specificity, roc_auc)
+```
+
+
+```{r}
+#To speed up computation, we can do them in parallel using **doParallel**:
+registerDoParallel()
+```
+
+### Tuning grid
+```{r}
+xgb_grid <- expand.grid(trees = 500 * 1:30, 
+                        learn_rate = c(0.1, 0.01, 0.001), 
+                        tree_depth = 1:3)
+```
+
+### Run tuning
+```{r}
+xgb_tune_res_opt <- tune_grid(
+  xgb_tune_wf_opt,
+  resamples = cv_folds_opt,
+  grid = xgb_grid,
+  metrics = class_metrics)
+```
+
+We can extract the metrics computed using our 10-fold CV as follows:
+
+```{r}
+xgb_tuning_opt <- xgb_tune_res_opt %>%
+  collect_metrics()
+xgb_tuning_opt
+
+save(xgb_tuning_opt, file = file.path(dirOutput, "xgb_tuning_opt.Rdata"))
+# load with: xgb_tuning <- load(file = file.path(dirOutput, "xgb_tuning.Rdata"))
+```
+
+## Visualising the results
+### Misclassification rate:
+```{r}
+xgb_tuning_opt %>% 
+  filter(.metric == "accuracy") %>% 
+  ggplot(aes(x = trees, y = 1 - mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "Misclassification rate") + 
+  facet_wrap(~ learn_rate)
+```
+### Sensitivity
+```{r}
+xgb_tuning_opt %>% 
+  filter(.metric == "sensitivity") %>% 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "Sensitivity") + 
+  facet_wrap(~ learn_rate)
+```
+This plot shows that a learning rate of 0.001 and 1 tree depth performs the best. Now it is important to look at the combination of sensitivity, specificity and roc_auc.
+
+### Specificity
+```{r}
+xgb_tuning_opt %>% 
+  filter(.metric == "specificity") %>% 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "Specificity") + 
+  facet_wrap(~ learn_rate)
+```
+### Accuracy, sensitivity and specificity together
+```{r}
+xgb_tuning_opt %>%
+  filter(.metric %in% c("accuracy", "sensitivity", "specificity")) %>%
+  ggplot(aes(x = trees, y = mean, colour = .metric)) +
+  geom_path() +
+  facet_wrap(learn_rate ~ tree_depth)
+```
+### Deciding on best parameters to use.
+Based on the figures above, we can decrease computing time by focusing on certain parameters. The learning rate should be 0.001 and the tree depth 1 as this gives the best sensitivity score. As it is important to look at a combination of the 3, it seems that a higher tree count is also important. 
+
+```{r}
+xgb_tuning_opt %>% 
+  filter(tree_depth == 1, learn_rate == 0.001, trees >= 10000 & trees <= 12000) %>% 
+  select(trees:learn_rate, .metric, mean) %>%
+    pivot_wider(trees:learn_rate,
+                names_from = .metric,
+                values_from = mean)
+```
+
+From these results can be concluded that between 1 and 500 trees are needed for the best all round results. There are only very slight differences between the metrics after this amount of trees.
+
+```{r}
+# Select best parameters
+xgb_best_opt <- xgb_tuning_opt %>% 
+  filter(.metric == "sensitivity", tree_depth == 1, learn_rate == 0.001, trees == 10500)
+xgb_final_wf_opt <- finalize_workflow(xgb_tune_wf_opt, xgb_best_opt)
+xgb_final_wf_opt
+```
+## Test set performance
+```{r}
+xgb_final_fit_opt <- xgb_final_wf_opt %>%
+  last_fit(optSample_split, metrics = class_metrics)
+```
+
+```{r}
+# results on the test set for class predictions
+xgb_test_results_opt <- xgb_final_fit_opt %>%
+  collect_metrics()
+xgb_test_results_opt
+
+save(xgb_test_results_opt, file = file.path(dirOutput, "xgb_test_results_opt.Rdata"))
+# load with: xgb_tuning <- load(file = file.path(dirOutput, "xgb_test_results.Rdata"))
+```
+
+# Train the model on the full data set
+This step gives us enough information to compare the two optimized models to choose the best one to finally train on the last given test set.
+
+The process is the same as the previous 2.
+
+## Recipe Setup
+```{r}
+#Creating model variations
+xgb_mdlfinal <- loan_status ~  int_rate + fico_range_low + home_ownership + loan_amnt + emp_length + verification_status
+
+# Creating recipe
+xgb_recipefinal <- recipe(xgb_mdlfinal, data = dfTrain) %>% 
+  step_dummy(home_ownership, emp_length, verification_status, one_hot = TRUE) %>%  # Only variables as factor, the rest are numeric
+  step_downsample(loan_status, seed = 23257) 
+xgb_recipefinal
+```
+
+## Tuning setup
+### Set parameters for tuning. Will focus on ensemble size, depth of each tree and the learning rate.
+```{r}
+xgb_model_tune_final <- 
+  boost_tree(trees = tune(), tree_depth = tune(), 
+             learn_rate = tune(), stop_iter = 500) %>% # We up the iterations to 500 again to ensure better performance.
+  set_mode("classification") %>%
+  set_engine("xgboost")
+```
+
+### Create workflow that can be tuned:
+```{r}
+xgb_tune_wffinal <- workflow() %>%
+  add_recipe(xgb_recipefinal) %>%
+  add_model(xgb_model_tune_final)
+xgb_tune_wffinal
+```
+
+### Select metrics
+```{r}
+class_metrics <- metric_set(accuracy, kap, sensitivity, 
+                            specificity, roc_auc)
+```
+
+
+```{r}
+#To speed up computation, we can do them in parallel using **doParallel**:
+registerDoParallel()
+# registerDoSEQ()
+```
+
+## Tuning grid
+As seen with the optimization and parameter tuning, the best results were found at 10500 trees, learn_rate = 0.001 and tree_depth = 1. Adding this will shorten computation. We still wanted to take a closer look around 10500 trees so decided to take increments of 50 trees instead of 500.
+
+```{r}
+xgb_gridfinal <- expand.grid(trees = 50 * 180:240, 
+                        learn_rate = c(0.001), 
+                        tree_depth = 1)
+```
+
+## Run tuning
+```{r}
+xgb_tune_resfinal <- tune_grid(
+  xgb_tune_wffinal,
+  resamples = cv_folds,
+  grid = xgb_gridfinal,
+  metrics = class_metrics)
+```
+
+We can extract the metrics computed using our 10-fold CV as follows:
+
+```{r}
+xgb_tuning_final <- xgb_tune_resfinal %>%
+  collect_metrics()
+xgb_tuning_final
+
+save(xgb_tuning_final, file = file.path(dirOutput, "xgb_tuning_final.Rdata"))
+# load with: xgb_tuning <- load(file = file.path(dirOutput, "xgb_tuning.Rdata"))
+```
+
+## Visualising the results
+### Misclassification rate:
+```{r}
+xgb_tuning_final %>% 
+  filter(.metric == "accuracy") %>% 
+  ggplot(aes(x = trees, y = 1 - mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "Misclassification rate") + 
+  facet_wrap(~ learn_rate)
+```
+### Sensitivity
+```{r}
+xgb_tuning_final %>% 
+  filter(.metric == "sensitivity") %>% 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "Sensitivity") + 
+  facet_wrap(~ learn_rate)
+```
+We see that 10700 trees performs the best.
+
+### Specificity
+```{r}
+xgb_tuning_final %>% 
+  filter(.metric == "specificity") %>% 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "Specificity") + 
+  facet_wrap(~ learn_rate)
+```
+### Accuracy, sensitivity and specificity together
+```{r}
+xgb_tuning_final %>%
+  filter(.metric %in% c("accuracy", "sensitivity", "specificity")) %>%
+  ggplot(aes(x = trees, y = mean, colour = .metric)) +
+  geom_path() +
+  facet_wrap(learn_rate ~ tree_depth)
+```
+
+## Deciding on best parameters to use.
+Based on the figures above, we can decrease computing time by focusing on certain parameters. We are going to look at the results for between 10500 and 11000 trees.
+
+```{r}
+xgb_tuning_final %>% 
+  filter(tree_depth == 1, learn_rate == 0.001, trees >= 10500 & trees <= 11000) %>% 
+  select(trees:learn_rate, .metric, mean) %>%
+    pivot_wider(trees:learn_rate,
+                names_from = .metric,
+                values_from = mean)
+```
+
+From these results can be concluded that between 10700 trees are needed for the best all round results. There are only very slight differences between the metrics after this amount of trees.
+
+```{r}
+#Select best parameters: regard to sensitivity => tbd!
+xgb_best_final <- xgb_tuning_final %>% 
+  filter(.metric == "sensitivity", tree_depth == 1, learn_rate == 0.001, trees == 10700)
+xgb_final_wf_final <- finalize_workflow(xgb_tune_wffinal, xgb_best_final)
+xgb_final_wf_final
+```
+## Test set performance
+
+```{r}
+xgb_final_fit_final <- xgb_final_wf_final %>%
+  last_fit(dfTrain_split, metrics = class_metrics)
+```
+
+```{r}
+# results on the test set for class predictions
+xgb_test_results_final <- xgb_final_fit_final %>%
+  collect_metrics()
+xgb_test_results_final
+
+save(xgb_test_results_final, file = file.path(dirOutput, "xgb_test_results_final.Rdata"))
+# load with: xgb_tuning <- load(file = file.path(dirOutput, "xgb_test_results.Rdata"))
+```
+## Confusion matrix and visual assessments of performance
+### Confusion matrix
+```{r}
+xgb_final_fit_final %>% collect_predictions() %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class) 
+```
+### ROC curve
+```{r}
+xgb_final_fit_final %>% collect_predictions() %>% 
+  roc_curve(loan_status, .pred_default) %>% 
+  autoplot()
+```
+
+### Lift curve
+```{r}
+xgb_final_fit_final %>% collect_predictions() %>% 
+  lift_curve(loan_status, .pred_default) %>% 
+  autoplot()
+```
+
+### Gain chart
+```{r}
+xgb_final_fit_final %>% collect_predictions() %>% 
+  gain_curve(loan_status, .pred_default) %>% 
+  autoplot()
+```
+
+# (The rest is just for the sake of double checking and interest. The Random Forest is the best performing model and the results of the computations below ascertain that.)
+
+## Load csv_test data
+We load the final test data after joining with the labels and adjusting the same way as we did for csv_train.
+
+```{r}
+load(file = file.path(dirOutput, "FinalTest.RData"))
+# Checking imported data
+skim(dfTestFull) %>% knit_print()
+str(dfTestFull)
+```
+
+## Create split object for final_fit()
+
+```{r}
+combined <- bind_rows(dfTrainFull, dfTestFull)
+ind <- list(analysis = seq(nrow(dfTrainFull)), assessment = nrow(dfTrainFull) + seq(nrow(dfTestFull)))
+dfFinal_split <- make_splits(ind, combined)
+dfFinal_split
+```
+
+## Set up for final model
+```{r}
+#Creating model for full dataset
+xgb_mdlfull <- loan_status ~  int_rate + fico_range_low + home_ownership + loan_amnt + emp_length + verification_status
+
+#Creating recipe 
+xgb_recipefull <- recipe(xgb_mdlfull, data = dfTrainFull) %>% 
+  step_dummy(home_ownership, emp_length, verification_status, one_hot = TRUE) %>%
+  step_downsample(loan_status, seed = 23257)
+xgb_recipefull
+
+xgb_model_tune_full <- 
+  boost_tree(trees = tune(), tree_depth = tune(), 
+             learn_rate = tune(), stop_iter = 500) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+
+# Create workflow that can be tuned:
+xgb_tune_wffull <- workflow() %>%
+  add_recipe(xgb_recipefull) %>%
+  add_model(xgb_model_tune_full)
+xgb_tune_wffull
+
+# Select metrics
+class_metrics <- metric_set(accuracy, kap, sensitivity, 
+                            specificity, roc_auc)
+
+registerDoParallel()
+
+#Tuning grid
+xgb_gridfull <- expand.grid(trees = 50 * 180:240, 
+                        learn_rate = c(0.001), 
+                        tree_depth = 1)
+
+# Run tuning
+xgb_tune_resfull <- tune_grid(
+  xgb_tune_wffull,
+  resamples = cv_folds,
+  grid = xgb_gridfull,
+  metrics = class_metrics)
+
+# Extract metrics
+xgb_tuning_full <- xgb_tune_resfull %>%
+  collect_metrics()
+xgb_tuning_full
+
+save(xgb_tuning_full, file = file.path(dirOutput, "xgb_tuning_full.Rdata"))
+# load with: xgb_tuning_full <- load(file = file.path(dirOutput, "xgb_tuning_full.Rdata"))
+
+```
+
+## VIsualize the result
+```{r}
+# Sensitivity
+xgb_tuning_full %>% 
+  filter(.metric == "sensitivity") %>% 
+  ggplot(aes(x = trees, y = mean, 
+             colour = factor(tree_depth))) +
+  geom_path() +
+  labs(y = "Sensitivity") + 
+  facet_wrap(~ learn_rate)
+```
+
+```{r}
+# Accuracy, sensitivity and specificity together
+xgb_tuning_full %>%
+  filter(.metric %in% c("accuracy", "sensitivity", "specificity")) %>%
+  ggplot(aes(x = trees, y = mean, colour = .metric)) +
+  geom_path() +
+  facet_wrap(learn_rate ~ tree_depth)
+```
+
+## Decide on best parameters
+```{r}
+xgb_tuning_full %>% 
+  filter(tree_depth == 1, learn_rate == 0.001, trees >= 10500 & trees <= 11000) %>% 
+  select(trees:learn_rate, .metric, mean) %>%
+    pivot_wider(trees:learn_rate,
+                names_from = .metric,
+                values_from = mean)
+```
+
+```{r}
+# Select best parameters: regard to sensitivity => tbd!
+xgb_best_full <- xgb_tuning_full %>% 
+  filter(.metric == "sensitivity", tree_depth == 1, learn_rate == 0.001, trees == 10700)
+xgb_final_wf_full <- finalize_workflow(xgb_tune_wffull, xgb_best_full)
+xgb_final_wf_full
+```
+
+## Test set performance
+```{r}
+xgb_final_fit_full <- xgb_final_wf_full %>%
+  last_fit(dfFinal_split, metrics = class_metrics)
+
+# results on the test set for class predictions
+xgb_test_results_full <- xgb_final_fit_full %>%
+  collect_metrics()
+xgb_test_results_full
+
+save(xgb_test_results_full, file = file.path(dirOutput, "xgb_test_results_full.Rdata"))
+# load with: xgb_tuning <- load(file = file.path(dirOutput, "xgb_test_results.Rdata"))
+```

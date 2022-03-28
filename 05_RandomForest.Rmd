@@ -1,0 +1,621 @@
+---
+title: "Random Forest"
+author: "Group 11"
+output: 
+  html_notebook:
+    toc: true
+    toc_float: false
+editor_options: 
+  chunk_output_type: inline
+---
+## Paths & Environment setup
+
+.Rmd files will use the folder they are located in as their default working directory. Because we use a shared OneDrive folder, this makes it easy to cooperate as no individual working directories have to be set up for each group member. We add an output folder for saving plots, graphs, tables, etc.
+
+```{r}
+# Clean environment
+remove(list=ls())
+
+# dirOutput contains the path to the output folder on OneDrive
+dir <- getwd()
+dirOutput <- paste0(dir,"/01_Output/")
+dirOutput
+
+
+```
+
+## Packages
+
+Several package are loaded needed for random forests. Note that the package 'yardsstick' has to be at least on version 0.0.9 to work with various metrics like sensitivity, specificity, etc.
+
+```{r}
+# Random forest tutorial
+library("tidyverse")
+library("tidymodels")
+library("doParallel")
+library("themis")
+library("xgboost")
+library("skimr")
+library("corrplot")
+library("stargazer")
+library("ggridges")
+library("treemapify")
+library("knitr")
+library("doParallel") # parallelize for rf
+library("vip") # variable importance measures
+```
+
+# First iteration
+In our first iteration we use all left-over features from the data exploration and feature engineering. 
+## Loading prepared data
+Data output from the data exploration file is loaded as .RData. This allows to simply update the .RData file in the first notebook in order to update the dataset later on if needed.
+### Final checking imported data
+```{r}
+load(file = file.path(dirOutput, "dataFirstIteration.RData"))
+# Checking imported data
+skim(dfTrain) %>% knit_print()
+```
+It is checked that both sets still have the same stratification on 'loan_status'.
+```{r}
+# Both sets still show similar default-ratio
+dfTrain %>% count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+dfTest %>% count(loan_status) %>% 
+  mutate(prop = n / sum(n))
+```
+
+## Recipe Setup
+In this step the initial recipes are set up including the 'dfTrain' set. Alternative to 'update_role'  we set up the models by explicitly writing them out for all variables used. This allows for better overview. The recipe includes 'step_downsample' in order to balance the dataset. At this point a 1:1 ratio was chosen. For all models evaluated in our group we used the same seed for step_downsample() to ensure that the results are comparable.
+```{r}
+# Instead of including all variables by default, we only use selected (Alternative: update_role())
+
+# Checking available variables
+cNames <- colnames(dfTrain)
+cNames
+levels(dfTrain$Division)
+
+#Creating model 1
+rf_mdl1 <- loan_status ~ int_rate + annual_inc + delinq_2yrs + fico_range_low + earliest_cr_line_year + Division + home_ownership + verification_status + open_acc + loan_amnt + emp_length + pub_rec + purpose
+
+#Creating recipe 
+
+rf_recipe_downsample1_1 <- recipe(rf_mdl1, data = dfTrain) %>% 
+  step_downsample(loan_status, seed = 23257) 
+rf_recipe_downsample1_1
+
+```
+
+## Tuning setup
+### Set parameters for tuning
+The models include tuning parameters for 'mtry' and 'tress' and is using the 'ranger' engine and is set to 'classification'. Additionally, one could also add the parameter 'under_ratio', however the increased computational demands were deemed too high for our hardware.
+
+```{r}
+rf_model_tune1 <- rand_forest(mtry = tune("Nr_mtry"), trees = tune("Nr_trees")) %>% 
+  set_mode("classification") %>%
+  set_engine("ranger")
+```
+
+We create a workflow out of our recipe and tuning parameters model.
+```{r}
+rf_tune_wf1 <- workflow() %>%
+  add_recipe(rf_recipe_downsample1_1) %>%
+  add_model(rf_model_tune1)
+rf_tune_wf1
+```
+
+### Select metrics
+We use several metrics to tune our models and evaluate their performance. Reasoning on the most important metrics is given in the RNotebook for data exploration. 
+
+```{r}
+class_metrics <- metric_set(accuracy, kap, sensitivity, 
+                            specificity, roc_auc, precision)
+```
+
+Activate parallel processing.
+```{r}
+# Do not forget to turn off in the end by using stopImplicitCluster()
+registerDoParallel()
+
+```
+
+### Tuning grid setup
+We set up our tuning grid. We have to find a balance between tuning for a large enough range of parameters while still making it computational reasonable on our hardware. 
+The optimal solution is to tune for the maximum number of trees (using 'mtryMax' here). However, this was to computational expensive for the first iteration. A tuning grid with mtry between 4:9  and number of trees 1000 or 1200 was chosen.
+```{r}
+# calculating maximal range for tuning mtry
+mtryMax <-  c(1:sum(rf_recipe_downsample1_1$var_info[3]=="predictor"))
+
+# Tuning grid setup
+rf_grid <- expand.grid(Nr_mtry = c(4:9), # Alternative using mtryMax
+                        Nr_trees = c(1000, 1200) 
+                        )
+
+```
+
+
+### Run tunning
+We run our model through all possible combinations in our tuning grid. We use a seed to ensure comparability for other models later on. 
+```{r}
+set.seed(34234783)
+rf_tune_res <- rf_tune_wf1 %>% 
+  tune_grid(
+  resamples = cv_folds,
+  grid = rf_grid,
+  metrics = class_metrics
+)
+```
+
+We can extract the metrics computed using our 10-fold CV (Alternatively a 5-fold set is created in order to reduce computation time). We see that the model mtry = 4 and trees = 1200 performance best with regard to sensitivity. 
+
+```{r}
+# Extract metrics, filter for sensitivity and arrange descending for a first check on our most important variable.
+rf_tune_res %>%
+  collect_metrics() %>%
+  filter(.metric == "sensitivity") %>% # Alternative: other measures like 'auc_roc'
+  arrange(desc(mean))
+
+# Extracting metrics into a result table
+RF_rslt_mdl1_11 <- rf_tune_res %>%
+  collect_metrics()
+
+# Saving the metrcis results table to a .RData file for comparison later on
+save(RF_rslt_mdl1_11, file = file.path(dirOutput, "RF_rslt_mdl1_11.Rdata"))
+```
+We decided in the beginning that we not only select our models with regard to sensitivity but also to auc_roc. Therefore we visualize the results to select the best parameters for our model. We see that our model performed best with mtry = 4 with regard to all metrics.
+```{r}
+# Visualizing regarding Nr_mtry
+rf_tune_res %>%
+  collect_metrics() %>%
+  filter(.metric %in% c("sensitivity", "specificity", "accuracy", "kap", "roc_auc")) %>%
+  ggplot(aes(x = Nr_mtry, y = mean, ymin = mean - std_err, ymax = mean + std_err, 
+             colour = .metric)) +
+  geom_errorbar() + 
+  geom_point() +
+  facet_grid(.metric ~ ., scales = "free_y") 
+```
+
+Because we also tune for the number of trees in our models, we visually inspect the performance differences based on this parameter. Therefore, the metric results from our tuning grid our group by mtry and trees and then a mean was calculated. For the first iteration we choose Nr_trees = c(1000,1200) only to see if we can see a significant improvement into any direction. 
+Based on the plot below we can see that the performance with regard to all metrics increase. However, the plot can be misleading: the y-axis only shows a small part of the full scale (100%). The improvements from using 1200 trees is not even 0.1%.  As a result it is decided to simply use the one-standard-error-rule in order to select the best model with regard to sensitivity. This will only choose the higher complexity of 1200 trees if the performance improvement is large enough - which is not likely to be the case.
+```{r}
+# Visualizing regarding Nr_trees 
+
+rf_tune_res %>%
+  # data.frame() %>%
+  #group_by(Nr_mtry) %>%
+  # summarize(Mean = mean(mean)) %>%
+  collect_metrics() %>%
+  group_by(.metric, Nr_trees) %>%
+  dplyr::summarize(Mean = mean(mean, na.rm=TRUE)) %>%
+  filter(.metric %in% c("sensitivity", "specificity", "accuracy", "kap", "roc_auc")) %>%
+  ggplot(aes(x = Nr_trees, y = Mean, 
+             colour = .metric)) +
+  geom_line() +
+  geom_point() +
+  facet_grid(.metric ~ ., scales = "free_y") 
+```
+### Select best tuning model
+Based on the considerations above, we choose the parameters for our model in the first iteration based on the one-standard-error-rule with regard to sensitivity. This will result in a mtry = 4, which performed best with regard to all metrics and trees = 1000, because the improvement for the more complex model was not large enough, although its performance on sensitivity is slightly better (see 'best_sens')
+```{r}
+#Select best parameters: regard to sens => tbd!
+rf_tune_res %>% 
+  collect_metrics()
+
+# Select best model according to sensitivity
+best_sens_stdError <- select_by_one_std_err(rf_tune_res, metric= "sensitivity", Nr_mtry) 
+best_sens_stdError 
+best_sens <- select_best(rf_tune_res, metric= "sensitivity")
+best_sens 
+```
+In a last step, we train the model with the chosen parameters on the entire training set and test it on the test set. 
+```{r}
+# Create final workflow for test set
+rf_final_wf <- finalize_workflow(rf_tune_wf1, best_sens_stdError)
+rf_final_wf
+```
+
+
+### Run on test set
+We run the final workflow on the split object containing the training and the test set.
+```{r}
+set.seed(9923)
+rf_final_fit <- rf_final_wf %>% 
+  last_fit(dfTrain_split, metrics = class_metrics)
+
+```
+
+
+We collect the results on the test set for class predictions regarding the selected metrics. We achieve 66.4% on specificity, indicating we can detect defaults within the test set to modest accurate degree. However, our goal for sensitivity was set to 70% in the beginning, which we did not achieve. 
+If this model is chosen for the second iteration additional tuning will be performed, which might allow us to achieve our goal of 70%.
+
+```{r}
+# one could tune the balancing of the training set, but no clear answer
+rf_final_fit %>%
+  collect_metrics()
+
+```
+
+## Confusion matrix
+We present our predictions on the test set in form of confusion matrix. We see that in 3389 cases the model predicted the default correctly but in 1711 falsely classified it as paid.
+```{r}
+rf_final_fit %>% collect_predictions() %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class) 
+```
+
+Plotting the ROC_AUC curve shows that no significant "elbow" can be found as an optimal threshold value. 
+```{r}
+# Plotting the Roc Auc curve 
+rf_final_fit %>% collect_predictions() %>% 
+  roc_curve(loan_status, .pred_default) %>% 
+  autoplot()
+```
+Plotting the lift curve gives an indication that our model is able to predict the number of defaults in the set twice as good as without a model by using around 12.5% of the observations with the highest predicting probability. 
+
+```{r}
+rf_final_fit %>% collect_predictions() %>% 
+  lift_curve(loan_status, .pred_default) %>% 
+  autoplot()
+```
+
+
+## Variable importance scores
+
+In order to identify which variables contribute most to our model we need to re-run the model including variable importance based on permutation. This scores quantifies the impact if a single feature at a time is shuffled randomly.
+
+We re-run the model if the tuning parameters chosen above:
+```{r}
+rf_model_vi <- rand_forest(mtry = 4, trees = 1000) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "permutation") # add importance testing on permutation to workflow
+
+rf_vi_wf <- workflow() %>% 
+  add_model(rf_model_vi) %>% 
+  add_recipe(rf_recipe_downsample1_1)
+```
+
+Now we can fit the model again, using the same random seed as above (when we used `last_fit()`):
+```{r}
+# Run model on training data
+set.seed(9923)
+rf_vi_fit <- rf_vi_wf %>% fit(data = dfTrain) # manually fitting the workflow on the entire training data, can be used instead of last_fit
+```
+
+The function vi() allows to extract the variable importance and by using vip() we can create a plot as seen below.
+The most important feature is 'int_rate' by far. It is followed by 'fico_range_low' and 'loan_amnt'. The importance of these feature seems plausible, as the interest rate will be determined by the perceived default-risk of the debtor. The overall credit score (Fico) represents the debtors historical ability to repay financial obligations.
+The concept of Directionality, e.g. if a feature increases or decreases probability to be in class A or B, is not really suited for random forest. However, the first two features it can be assumed that a higher interest rate and a higher fico score indicate a higher probability to default. However, this is just an assumption based on theoretical reasoning.
+
+```{r}
+# extract variable importance values
+rf_vi_fit %>% extract_fit_parsnip() %>% vi() # retrive fit-object
+```
+
+```{r}
+# plot variable importance values
+rf_vi_fit %>% extract_fit_parsnip() %>% vip(geom = "point", num_features = 13)
+```
+
+# Second iteration
+After comparing the four models at the end of the first iteration, we selected two models for further tuning in a second iteration based on the models performance on the test set (split from 'csv_train') with regard to sensitivity and roc_auc. 
+The random forest technique was deemed to be promising and selected for the second round.
+The following approaches were chosen to further improve the RF model:
+
+i)  The most promising tuning is to extend the tuning grid for the parameters 'mtry' and 'trees'.
+
+ii) We experiment with the additional tuning parameter 'under_ratio' for step_downsample() which controls the ratio of the imbalance in teh variable 'loan_status'. The reasoning is, that a model trained on imbalanced data might perform better on imbalanced test data.
+
+iii) Reversing the log transformation of the variable 'annual_inc' (which was done in the data preparation). This was done because the log transformation might smooth out information that could be used by the RF to detect differences. We do not expect significant improvement by this but also no worsening.
+
+iv) Removing variables with low importance score: This is only likely to improve our model if some of the variables are still highly correlated with each other.
+
+## Feature engineering
+
+```{r}
+# Reversing log-transformation of annual income done in data cleaning
+dfTrain$annual_inc <- exp(dfTrain$annual_inc)
+
+```
+
+## Recipe setup
+Creating model variations by removing variables
+```{r}
+#mdl2: Exlcudes 'pub_rec', 'open_acc', 'purpose', 'delinq_2yrs', 'Division' based on VIP from 1. iteration
+rf_mdl2 <- loan_status ~ int_rate + annual_inc + fico_range_low + earliest_cr_line_year + home_ownership + verification_status + open_acc + loan_amnt + emp_length  
+
+#mdl2: Exlcudes 'pub_rec', 'open_acc', 'purpose', 'delinq_2yrs', 'Division', earliest_cr_line_year, emp_length based on VIP from 1. iteration
+rf_mdl3 <- loan_status ~ int_rate + annual_inc + fico_range_low + home_ownership + verification_status + open_acc + loan_amnt 
+
+```
+
+Creating recipes with different values for 'under_ratio' and models
+```{r}
+# mdl2
+# Downsampling: 1:1
+rf_recipe_ds11_mdl2 <- recipe(rf_mdl2, data = dfTrain) %>% 
+  step_downsample(loan_status, seed = 23257) 
+# mdl2
+# Downsampling: 1:2
+rf_recipe_ds12_mdl2 <- recipe(rf_mdl2, data = dfTrain) %>% 
+  step_downsample(loan_status, seed = 23257, under_ratio = 2)
+# mdl3
+# Downsampling: 1:1
+rf_recipe_ds11_mdl3 <- recipe(rf_mdl3, data = dfTrain) %>% 
+  step_downsample(loan_status, seed = 23257) 
+
+```
+
+
+## Tuning setup
+### Create new workflows
+Using same tuning parameters as before: mtry and trees
+```{r}
+# Same tuning parameters as for iteration 1 (see 'rf_model_tune1')
+rf_model_tune1
+```
+
+```{r}
+# Creating various workflows
+rf_tune_wf_mdl2_11 <- workflow() %>%
+  add_recipe(rf_recipe_ds11_mdl2) %>%
+  add_model(rf_model_tune1)
+rf_tune_wf_mdl2_11
+
+rf_tune_wf_mdl2_12 <- workflow() %>%
+  add_recipe(rf_recipe_ds12_mdl2) %>%
+  add_model(rf_model_tune1)
+rf_tune_wf_mdl2_12
+
+rf_tune_wf_mdl3_11 <- workflow() %>%
+  add_recipe(rf_recipe_ds11_mdl3) %>%
+  add_model(rf_model_tune1)
+rf_tune_wf_mdl3_11
+```
+
+### Select metrics
+Same metrics chosen as in iteration 1 (see'class_metrics')
+```{r}
+class_metrics
+```
+
+Increasing tuning grid to 'mtryMax' and trees = c(500, 1000, 1500). 
+```{r}
+# Select max number of mtry based on number of features in the model
+mtryMax_mdl2 <-  c(1:sum(rf_recipe_ds11_mdl2$var_info[3]=="predictor"))
+mtryMax_mdl3 <-  c(1:sum(rf_recipe_ds11_mdl3$var_info[3]=="predictor"))
+
+# New tuning grid for iteration 2
+# grids are numbered 1:n for each workflow
+rf_grid_2 <- expand.grid(Nr_mtry = mtryMax_mdl2, # Alternative: mtryMax_mdl3
+                        Nr_trees = c(500, 1000, 1500) 
+                        )
+```
+
+
+## Tuning
+### Tune using grid
+
+```{r}
+# Activate parallel processing
+registerDoParallel()
+```
+
+Run tuning grid for selected workflow with new tuning grid. be aware that the follwoing steps have to be performed for each of the workflows defined above. The workflows were changed manually. The current setup represents only one of these workflows.
+```{r}
+set.seed(34234783)
+rf_tune_res_mdl3_ds11 <- rf_tune_wf_mdl3_11 %>% 
+  tune_grid(
+  resamples = cv_folds,
+  grid = rf_grid_2,
+  metrics = class_metrics
+)
+
+```
+
+
+### Collect results
+Collect the results metric tables and save them to an .RData file.
+```{r}
+rf_tune_res_mdl3_ds11 %>% 
+  collect_metrics()
+
+rf_tune_res_mdl3_ds11 %>% 
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(desc(mean))
+
+# Extracting metrics and save tuning results 
+
+RF_rslt_mdl3_11 <- rf_tune_res_mdl3_ds11 %>%
+  collect_metrics()
+
+save(RF_rslt_mdl3_11, file = file.path(dirOutput, "RF_rslt_mdl3_11.Rdata"))
+```
+
+
+### Plot results for visual inspection
+First, results from previous models are loaded and combined into a table for better comparison. 
+```{r}
+# Load all result tables from all models
+load(file = file.path(dirOutput, "RF_rslt_mdl1_11.Rdata")) 
+load(file = file.path(dirOutput, "RF_rslt_mdl2_11.Rdata"))
+load(file = file.path(dirOutput, "RF_rslt_mdl2_12.Rdata"))
+load(file = file.path(dirOutput, "RF_rslt_mdl3_11.Rdata"))
+
+# Combining result tables from all models
+rslt_tuning_combined <- bind_rows(RF_rslt_mdl1_11, RF_rslt_mdl2_11, RF_rslt_mdl2_12, RF_rslt_mdl3_11, .id = "Model")
+
+rslt_tuning_combined %>%
+  group_by(Model) %>%
+  filter(.metric %in% c("sensitivity","roc_auc")) %>%
+  #filter(mean == max(mean))%>%
+  arrange(desc(mean))
+  
+```
+
+The visualization is performed similar to iteration one to choose best values from tuning parameters.
+```{r}
+# Insert metric dataframe for each model
+RF_rslt_mdl3_11 %>%
+  # collect_metrics() %>% depends if tune_grid output is used or loaded metric table
+  filter(.metric %in% c("sensitivity", "specificity", "accuracy", "kap", "roc_auc")) %>%
+  ggplot(aes(x = Nr_mtry, y = mean, ymin = mean - std_err, ymax = mean + std_err, 
+             colour = .metric)) +
+  geom_errorbar() + 
+  geom_point() +
+  facet_grid(.metric ~ ., scales = "free_y") 
+```
+
+## Select best tuned model
+A reasoning similar to iteration one is used to select best parameters according to the one-standrd-error-rule based on sensitivity and auc_roc.
+```{r}
+best_sens <- select_best(rf_tune_res_mdl3_ds11, metric= "sensitivity") 
+best_sens_stdError <- select_by_one_std_err(rf_tune_res_mdl3_ds11, metric= "sensitivity", Nr_mtry) 
+# Create final workflow for test set
+# name workflows according to used mdl and ds ratio
+# Attention: change wf for each model
+rf_final_wf_2nd <- finalize_workflow(rf_tune_wf_mdl3_11, best_sens_stdError)
+rf_final_wf_2nd
+```
+
+
+### Run all tuned models on test set
+
+```{r}
+set.seed(9923)
+rf_final_fit_2nd <- rf_final_wf_2nd %>%
+  last_fit(dfTrain_split, metrics = class_metrics)
+```
+
+```{r}
+rf_final_fit_2nd %>%
+  collect_metrics() 
+#%>% # Can be used to filter and sort according to specific metric
+ # filter(metric == "sensitivity") %>%
+ # arrange(desc(mean))
+  
+```
+
+# Results: Best model
+
+After tuning the models with the aforementioned adjustments (i-iv) every model was evaluated on the test set, similar to iteration 1. The insights can be summarized as follows:
+
+- extending the tuning grid for mtry and trees was the most impactful approach and resulted in better sensitivity scores on the test set of about 68.5%
+
+- Adjusting the parameter 'under_ratio' to a 2:1 ratio resulted in significant worse performances from sensitivity and was rejected as a tuning approach.
+
+- Revising log-transformation was not done one its own and therefore cannot definitely be interpreted. However, the best performing model included the revised variable 'annual_inc'.
+
+- Removing variable from the model did not seem to improve performance. The performance improvement of the models with reduced number of variables arises most likely from the extended tuning grid.
+
+Finally, the original model, including all available features, a revised variable 'annual_inc', a step_down ratio of 1:1 was chosen to be the most effective one with the parameters mtry = 1 and trees = 500
+
+# Final assessment on 'csv_test' data set
+
+### Load csv_test data
+We load the final test data after joining with the labels and adjusting the same way as we did for csv_train.
+
+```{r}
+# load prepared csv_test data
+load(file = file.path(dirOutput, "FinalTest.RData"))
+# load prepared csv_train data
+load(file = file.path(dirOutput, "dataFirstIteration.RData"))
+
+```
+
+### Last variable transformation
+Optionally the variable 'annual_inc' can be exp-transformed to reverse the log-transformation. However, this will have no impact in the performance of the final model
+```{r}
+# reverse log-transformation on both data sets 
+dfTrainFull$annual_inc <- exp(dfTrainFull$annual_inc)
+dfTestFull$annual_inc <- exp(dfTestFull$annual_inc)
+
+# Checking transformed  data
+skim(dfTestFull) %>% knit_print()
+```
+
+
+### Create split object for final_fit()
+Based on the prepared data set based on csv_train and csv_test a new split object is created in order to use the last_fit() function. 
+```{r}
+combined <- bind_rows(dfTrainFull, dfTestFull)
+ind <- list(analysis = seq(nrow(dfTrainFull)), assessment = nrow(dfTrainFull) + seq(nrow(dfTestFull)))
+dfFinal_split <- make_splits(ind, combined)
+dfFinal_split
+```
+
+### Set up for final model
+The best model is again run on the optimal parameters mtry = 1 and trees = 500 using the same seeds as for the iterations before. This is done to construct the final model and select it for the last_fit() function, which will train the model on the full training set and then test on the final test set.
+```{r}
+#Creating model 1
+rf_mdl_final <- loan_status ~ int_rate + annual_inc + delinq_2yrs + fico_range_low + earliest_cr_line_year + Division + home_ownership + verification_status + open_acc + loan_amnt + emp_length + pub_rec + purpose
+
+#Creating recipe 
+rf_recipe_downsample1_1 <- recipe(rf_mdl_final, data = dfTrain) %>% 
+  step_downsample(loan_status, seed = 23257) 
+rf_recipe_downsample1_1
+
+rf_model_tune1 <- rand_forest(mtry = tune("Nr_mtry"), trees = tune("Nr_trees")) %>% 
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+# We create a workflow out of our recipe and tuning parameters model.
+rf_tune_wf_final <- workflow() %>%
+  add_recipe(rf_recipe_downsample1_1) %>%
+  add_model(rf_model_tune1)
+rf_tune_wf_final
+
+# Tuning grid setup for final model
+rf_grid_final <- expand.grid(Nr_mtry = c(1), 
+                        Nr_trees = c(500) 
+                        )
+# run tuning grid
+set.seed(34234783)
+rf_tune_res_final <- rf_tune_wf_final %>% 
+  tune_grid(
+  resamples = cv_folds,
+  grid = rf_grid_final,
+  metrics = class_metrics
+)
+
+# Collect metrics
+rf_tune_res_final %>%
+  collect_metrics()
+
+# Select best (&only) model
+best_sens_final <- select_best(rf_tune_res_final, metric= "sensitivity")
+
+# Create final workflow for test set
+rf_final_wf_final <- finalize_workflow(rf_tune_wf_final, best_sens_final)
+rf_final_wf_final
+
+# Run on dfTestFull
+set.seed(9923)
+rf_final_fit_final <- rf_final_wf_final %>% 
+  last_fit(dfFinal_split, metrics = class_metrics)
+
+# Collect metrics
+rf_final_fit_final %>%
+  collect_metrics()
+
+```
+
+# Final comments
+In the beginning we set our goal to 70% sensitivity and 60% specificity. 
+After our first iteration we achieved a sensitivity performance of 66.4%, after our second iteration we could improve this value to 68.5%. Both this metrics refer to performance on a subset used as test set of the original csv_train.
+
+After training the final model with all available variables, mtry = 1, and trees = 500 on the entire csv_train data, we tested the data on the final test set from csv_test and achieved a sensitivity score of 68.6%. 
+
+This improvement on the final test set implies that the training on the full data set increased its performance and that the model is not prone to overfitting on the training data.
+
+Although this does not fulfill our set goal, its still a quite good performance. This level of sensitivity can definitely be used on a real world case for investor to pre-select loans which our model deems to not default. However, it is adviced to not only rely on this model for investment decision, but rather use this model as a pre-selection tool to generate a long list of potential investments and save time on the initial selection. In a second step additional research has to be undertaken to select the final investments. 
+
+Future improvements can include testing additional machine learning methods like neural networks. Also including additional information on the debtors would be useful to improve prediction quality. 
+
+```{r}
+# Saving image of workspace to archive results
+save.image(file = file.path(dirOutput, "Image_RF.Rdata"))
+
+```
+
+
+
+
+

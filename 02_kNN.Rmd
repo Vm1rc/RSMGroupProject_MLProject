@@ -1,0 +1,215 @@
+---
+title: "Logistic Regression & k-Nearest Neighbours"
+output:
+  html_notebook:
+    toc: true
+    toc_float: false
+editor_options:
+  chunk_output_type: inline
+---
+
+# Overview
+
+This notebook shows the R code and results for the first two methods: Logistic Regression and k-Nearest Neighbours. Logistic Regression will only be used as a baseline model.
+
+## Packages
+
+Several packages have to be loaded for Logistic Regression and k-Nearest Neighbours:
+
+```{r  message = FALSE, warning=FALSE, include=FALSE}
+library("tidymodels")
+library("kknn")
+library("themis")
+```
+
+## Loading the cleaned data
+
+All methods use the same cleaned data from the Data_cleaning.Rmd notebook as input. We assume that the data file dataFirstIteration.RData is available in the same folder as this notebook.
+
+```{r}
+load("dataFirstIteration.RData")
+```
+
+# Logistic Regression
+
+Before performing Logistic Regression We have to set-up a workflow. This starts with specifying the model:
+
+```{r}
+lr_mod <- logistic_reg() %>% 
+  set_engine("glm")
+```
+
+The next step is to specify a recipe for handling the data. This includes the linear model between the target variable loan_status and the other independent variables. Besides, in terms of the target variable loan_status we downsample the majority class to the same size as the minority class to handle the imbalance (85%-15% ratio). For this, all methods use the same seed value for downsampling. Also, we create dummy variables for the categorical variables to ensure that all features are represented numerically, as required for logistic regression:
+
+```{r}
+lr_mod_recipe <- recipe(loan_status ~ int_rate + loan_amnt  + emp_length + annual_inc + verification_status 
+                        + delinq_2yrs + open_acc + pub_rec + fico_range_low + purpose + installment 
+                        +  earliest_cr_line_year + Division,      
+                       data = dfTrain) %>% 
+  step_downsample(loan_status, seed = 23257) %>%
+  step_dummy(emp_length, verification_status, purpose, Division)  
+```
+
+The model and recipe can now be combined into a workflow:
+
+```{r}
+lr_mod_workflow <- 
+  workflow() %>% 
+  add_model(lr_mod) %>% 
+  add_recipe(lr_mod_recipe)
+```
+
+With the last_fit function we finally can train our own training set, and test it on our own test set (as split in the dfTrain_split object from the Data_cleaning.Rmd notebook). For this, we also specify several metrics for measuring the performance.
+
+```{r , warning=FALSE}
+lr_last_fit <- lr_mod_workflow %>% 
+  last_fit(dfTrain_split, 
+           metrics = metric_set(accuracy, kap, sensitivity, specificity, roc_auc))
+```
+
+The performance metrics are then displayed:
+
+```{r}
+lr_metrics <- lr_last_fit %>% collect_metrics()
+lr_metrics
+```
+
+```{r}
+lr_metrics <- lr_metrics %>% 
+  select(-.estimator, -.config) %>% 
+  mutate(model = "logistic_reg")
+lr_metrics %>%  
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
+
+# k-Nearest Neighbours
+
+For the k-Nearest Neighbour algorithm we first have to tune the hyperparameter k which is the number of neighbours. This consist of two additional steps: Setting up a tuning grid and Tuning the number of neighbours.
+
+## Setting up a tuning grid
+
+Without knowing what the best value of k could be, we started with a wide tuning grid with values between 1 and 1000 in relatively large steps of 50:
+
+```{r}
+knn_class_tune_grid <- tibble(neighbors = 1:19*50+1)
+knn_class_tune_grid
+```
+
+## Specifying a workflow
+
+Just as in the Logistic Regression case we have to specify a workflow, starting with specifying the model. This time we also have to mention that the number of neighbours has to be tuned:
+
+```{r}
+knn_class_mod <- nearest_neighbor(neighbors = tune()) %>% 
+  set_mode("classification") %>% 
+  set_engine("kknn")
+```
+
+Again, we need to specify a recipe mentioning the target variable loan_status and the other independent variables, downsampling the majority class, and introducing dummy variables for the categorical variables. In addition, the numerical variables need to be normalized:
+
+```{r}
+knn_class_recipe <- 
+  recipe(loan_status ~ int_rate + home_ownership + loan_amnt  + emp_length + annual_inc + verification_status 
+         + delinq_2yrs + open_acc + pub_rec + fico_range_low + purpose + installment +  earliest_cr_line_year 
+         + Division,     
+         data = dfTrain) %>% 
+  step_downsample(loan_status, seed = 23257) %>%
+  step_dummy(home_ownership, emp_length, verification_status, purpose, Division) %>%   
+  step_normalize(int_rate, loan_amnt, annual_inc, open_acc, fico_range_low, delinq_2yrs, pub_rec, installment,
+                 earliest_cr_line_year)  
+```
+
+The model and recipe can then be combined into a workflow:
+
+```{r}
+knn_class_workflow <-
+  workflow() %>% 
+  add_model(knn_class_mod) %>% 
+  add_recipe(knn_class_recipe)
+```
+
+## Tuning the number of neighbours
+
+Before we can test the performance of the k-Nearest Neighbour method we have to find the best value for the number of neighbours. For this, we perform a grid search over the tuning grid which was set up above. Although it is possible to perform parameter tuning with a validation set (part of training set), we choose to use 10-fold cross-validation which is more robust. In the Data_cleaning.Rmd notebook 10 folds have been made, which can be used for all methods. For measuring the performance of a particular value of k, we use the same metrics as before:
+
+```{r}
+knn_class_tune_res <- knn_class_workflow %>% 
+  tune_grid(resamples = cv_folds, 
+            grid = knn_class_tune_grid,
+            metrics = metric_set(accuracy, kap, sensitivity, 
+                            specificity, roc_auc))
+```
+
+After tuning we can collect the metrics:
+
+```{r}
+knn_class_tune_metrics <- knn_class_tune_res %>% collect_metrics()
+knn_class_tune_metrics
+```
+
+and plot each metric in as separate plot:
+
+```{r}
+knn_class_tune_metrics %>% 
+  ggplot(aes(x = neighbors, y = mean)) + 
+  geom_point() + geom_line() + 
+  facet_wrap(~ .metric, scales = "free_y")
+```
+
+```{r}
+autoplot(knn_class_tune_res)
+```
+
+Not only can we see visually what the best value of k is for our most important metric sensitivity, we can also display the 5 highest values for sensitivity:
+
+```{r}
+knn_class_tune_res %>% 
+  show_best(metric = "sensitivity", n = 5) %>% 
+  arrange(desc(mean), desc(neighbors))
+```
+
+and choose the one with the highest sensitivity:
+
+```{r}
+knn_class_best_model <- knn_class_tune_res %>% 
+  select_best(metric = "sensitivity")
+knn_class_best_model
+```
+
+This seems to be the model with 351 neighbours. By looking at the shape of the sensitivity plot, there could be values for k around 351 with a slightly higher value of the sensitivity. However, we do not expect that to be higher than 0.615, which is pretty close to the value found so far. So in this stage of exploration there is no need for making a finer tuning grid.
+
+## Finalizing the workflow
+
+After finding the best value for k, we now can finalize the workflow:
+
+```{r}
+knn_class_workflow_final <- 
+  knn_class_workflow %>% 
+  finalize_workflow(knn_class_best_model)
+knn_class_workflow_final
+```
+
+Like in the Logistic Regression case with the last_fit function we finally train our own training set, and test it on our own test set. Again, specifying the same metrics for measuring the performance:
+
+```{r}
+knn_class_last_fit <- knn_class_workflow_final %>% 
+  last_fit(dfTrain_split, 
+           metrics = metric_set(accuracy, kap, sensitivity, 
+                            specificity, roc_auc))
+```
+
+We then collect the performance metrics:
+
+```{r}
+knn_class_metrics <- knn_class_last_fit %>% 
+  collect_metrics()
+knn_class_metrics
+```
+
+```{r}
+knn_class_metrics <- knn_class_metrics %>% 
+  select(-.estimator, -.config) %>% 
+  mutate(model = "knn_class")
+knn_class_metrics %>% 
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
